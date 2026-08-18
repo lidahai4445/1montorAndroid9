@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
@@ -22,9 +23,11 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.log10
 import kotlin.math.sqrt
+import utils.AppLogger
+import data.RecordingMode
 
 /**
- * 智能音频引擎 - 稳定性与精确度重构版
+ * 智能音频引擎 - 实时全状态动态追踪版
  */
 class AudioEngine(
     private val context: Context,
@@ -46,13 +49,11 @@ class AudioEngine(
     // 算法参数
     // =========================================================
     private val sampleIntervalMs = 100L    // 采样间隔 100ms
-    private val triggerOffset = 8          // 触发偏移 8dB
-    private val minRecordingDurationMs = 2000L // 最短录音 2 秒 (防跳变)
     
-    private var triggerThreshold = -40     // 触发录音阈值
-    private val ambientSamples = ArrayDeque<Int>() // 10秒滑动窗口 (100点)
-    private val triggerSamples = ArrayDeque<Int>() // 15秒滑动窗口 (150点) - 用于开始和停止逻辑
-    
+    private var triggerThreshold = 30      // 触发录音阈值
+    private var envNoise = 30.0            // 动态追踪底噪基线
+    private val triggerSamples = ArrayDeque<Int>() // 15秒滑动窗口 (150点) - 用于分布统计和逻辑判定
+
     private var lastSampleTime = 0L
     private var recordingStartTime = 0L
 
@@ -91,9 +92,9 @@ class AudioEngine(
 
         running = true
         currentState = AudioState.STATE_INIT
-        ambientSamples.clear()
         triggerSamples.clear()
         preBuffer.clear()
+        envNoise = 30.0 
         
         AudioStateRepo.isRunning.value = true
         AudioStateRepo.currentStatus.value = "环境建模中..."
@@ -121,7 +122,7 @@ class AudioEngine(
                     sum += value * value
                 }
                 val rms = sqrt(sum / read)
-                val db = if (rms > 0) (20.0 * log10(rms)).toInt() else -100
+                val db = if (rms > 0) (20.0 * log10(rms)).toInt().coerceIn(0, 120) else 0
 
                 AudioStateRepo.currentDb.value = db
                 val now = System.currentTimeMillis()
@@ -137,37 +138,65 @@ class AudioEngine(
     }
 
     private fun processAlgorithm(db: Int) {
-        // 1. 更新环境底噪窗口 (10秒 = 100个采样点)
-        ambientSamples.addLast(db)
-        if (ambientSamples.size > 100) ambientSamples.removeFirst()
+        val currentMode = AudioStateRepo.recordingMode.value
+        val offset = AudioStateRepo.triggerOffset.value
+        val currentDbVal = db.toDouble()
 
-        // 2. 动态更新阈值: 10s内 4个最低值的平均分贝 + 8dB
-        if (ambientSamples.size >= 4) {
-            val sorted = ambientSamples.sorted()
-            val lowestFour = sorted.take(4)
-            val envNoise = lowestFour.average().toInt()
-            triggerThreshold = envNoise + triggerOffset
-            AudioStateRepo.currentThreshold.value = triggerThreshold
+        // 1. 全程动态底噪追踪 (不论监听还是录音，均实时更新)
+        if (currentDbVal < envNoise) {
+            // 快降：环境变安静，迅速跟进
+            val fallWeight = (AudioStateRepo.fallSpeed.value * 0.04).coerceIn(0.01, 0.9)
+            envNoise = envNoise * (1.0 - fallWeight) + currentDbVal * fallWeight
+        } else {
+            // 能量分布自适应加速 (核心：区分噪音与人声)
+            if (triggerSamples.size >= 30) {
+                val highCount = triggerSamples.count { it > envNoise }
+                val ratio = highCount.toDouble() / triggerSamples.size
+                
+                // 1. 获取用户设置的变率倍率 (1-10, 5为标准1.0x)
+                val userSpeedFactor = AudioStateRepo.trackingSpeed.value / 5.0
+                
+                // 2. 录音保护因子：录音中追踪速度削减至 5%，确保持久录音不断
+                val recordingProtection = if (currentState == AudioState.STATE_RECORDING) 0.05 else 1.0
+                
+                val finalFactor = userSpeedFactor * recordingProtection
+
+                // 3. 极致加速梯度 (全线应用 finalFactor)
+                val riseWeight = when {
+                    ratio >= 0.98 -> 0.35 * finalFactor  // 0.5秒内对齐
+                    ratio >= 0.90 -> 0.15 * finalFactor  // 1秒内对齐
+                    ratio >= 0.80 -> 0.06 * finalFactor
+                    else -> 0.001 * finalFactor         // 极慢：保护人声录制
+                }
+                
+                envNoise = envNoise * (1.0 - riseWeight.coerceAtMost(0.9)) + currentDbVal * riseWeight.coerceAtMost(0.9)
+            } else {
+                // 初始化阶段：常规跟进
+                envNoise = envNoise * 0.95 + currentDbVal * 0.05
+            }
         }
 
-        // 3. 更新触发/停止判定窗口 (15秒 = 150采样点)
+        // 2. 实时更新触发阈值
+        triggerThreshold = envNoise.toInt() + offset
+        AudioStateRepo.currentThreshold.value = triggerThreshold
+
+        // 3. 更新判定窗口 (15s)
         triggerSamples.addLast(db)
         if (triggerSamples.size > 150) triggerSamples.removeFirst()
 
         // 4. 状态机逻辑
         when (currentState) {
             AudioState.STATE_INIT -> {
-                // 等待至少 5 秒数据，让底噪稳定
-                if (ambientSamples.size >= 50) {
+                if (triggerSamples.size >= 10) {
                     currentState = AudioState.STATE_LISTENING
                     AudioStateRepo.currentStatus.value = "正在监听"
+                    AppLogger.log(context, "🔄 建模完成 [${currentMode.name}] 基线：${envNoise.toInt()}dB")
                 } else {
-                    AudioStateRepo.currentStatus.value = "环境建模中(${ambientSamples.size}/50)"
+                    AudioStateRepo.currentStatus.value = "初始化(${triggerSamples.size}/10)"
                 }
             }
 
             AudioState.STATE_LISTENING -> {
-                // 判定触发：最近 5 秒内 (50个样本) >= 30% (15个) 超过阈值
                 if (triggerSamples.size >= 50) {
                     val last5s = triggerSamples.takeLast(50)
                     val triggerCount = last5s.count { it > triggerThreshold }
@@ -176,22 +205,28 @@ class AudioEngine(
                         currentState = AudioState.STATE_RECORDING
                         AudioStateRepo.isRecording.value = true
                         AudioStateRepo.currentStatus.value = "正在录音"
+                        AppLogger.log(context, "🎤 [突发] 触发录音 (阈值:$triggerThreshold dB)")
                     }
                 }
             }
 
             AudioState.STATE_RECORDING -> {
-                // 判定停止：最近 15 秒内 (150个样本) >= 70% (105个) 低于或等于阈值
-                if (triggerSamples.size >= 150) {
-                    val silenceCount = triggerSamples.count { it <= triggerThreshold }
-                    val now = System.currentTimeMillis()
-                    // 必须满足停止比例，且录制时间超过 2 秒，才允许停止
-                    if (silenceCount >= 105 && (now - recordingStartTime) >= minRecordingDurationMs) {
-                        stopRecordingAction()
-                        currentState = AudioState.STATE_LISTENING
-                        AudioStateRepo.isRecording.value = false
-                        AudioStateRepo.currentStatus.value = "正在监听"
+                val now = System.currentTimeMillis()
+                val recordingDuration = now - recordingStartTime
+                val evalDelay = AudioStateRepo.stopEvalDelayMs.value
+                
+                if (recordingDuration >= evalDelay) {
+                    if (triggerSamples.size >= 150) {
+                        val silenceCount = triggerSamples.count { it <= triggerThreshold }
+                        if (silenceCount >= 105) {
+                            stopRecordingAction()
+                            currentState = AudioState.STATE_LISTENING
+                            AudioStateRepo.isRecording.value = false
+                            AudioStateRepo.currentStatus.value = "正在监听"
+                        }
                     }
+                } else {
+                    AudioStateRepo.currentStatus.value = "录音中(锁定:${(evalDelay - recordingDuration) / 1000}s)"
                 }
             }
         }
@@ -252,14 +287,27 @@ class AudioEngine(
     }
 
     private fun stopRecordingAction() {
+        val duration = System.currentTimeMillis() - recordingStartTime
+        val minSaveDuration = AudioStateRepo.minSaveDurationMs.value
+        
         try {
             pcmOutputStream?.flush()
             pcmOutputStream?.close()
             pcmOutputStream = null
             
             val fileToSave = tempPcmFile
-            if (fileToSave != null && fileToSave.exists() && fileToSave.length() > 0) {
-                finalizeWavFile(fileToSave)
+            if (fileToSave != null && fileToSave.exists()) {
+                if (duration >= minSaveDuration) {
+                    finalizeWavFile(fileToSave)
+                    val now = System.currentTimeMillis()
+                    AudioStateRepo.lastValidRecordTime.value = now
+                    data.AppPreferences(context).saveLastValidRecordTime(now)
+                    AppLogger.log(context, "✅ 生成有效录音，时长：${duration/1000}秒，已保存")
+                } else {
+                    fileToSave.delete()
+                    AudioStateRepo.currentStatus.value = "录音过短(${duration/1000}s),已舍弃"
+                    AppLogger.log(context, "🗑️ 产生未保存的短时录音，时长：${duration/1000}秒，已自动丢弃")
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -288,7 +336,6 @@ class AudioEngine(
                         AudioStateRepo.lastSavedFile.value = fileName
                     }
                 }
-                // 清理临时文件
                 pcmFile.delete()
             } catch (e: Exception) {
                 e.printStackTrace()

@@ -4,12 +4,13 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,44 +18,41 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import data.AppPreferences
+import ui.LogScreen
+import ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: AppPreferences
 
+    // 页面导航状态
+    private var currentScreen by mutableStateOf("Main")
+
     // 用户选择的录音保存目录显示
     private var saveDirectory by mutableStateOf("未选择")
     private var saveTreeUri by mutableStateOf<Uri?>(null)
-
-    // 清理策略
-    private var cleanupDays by mutableIntStateOf(0)
 
     // 无障碍服务状态
     private var isAccessibilityEnabled by mutableStateOf(false)
 
     private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startDetect()
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
+            // 通知权限是可选的，但如果用户拒绝了麦克风权限则无法工作
+            if (audioGranted) {
+                startDetect()
+            } else {
+                // 处理权限拒绝
+            }
         }
 
     private val folderPicker =
@@ -73,6 +71,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
@@ -84,36 +83,56 @@ class MainActivity : ComponentActivity() {
             saveTreeUri = uri
             updateDirectoryDisplay(uri)
         }
-        cleanupDays = prefs.getCleanupDays()
 
         setContent {
             MaterialTheme {
-                val currentDb by AudioStateRepo.currentDb.collectAsState()
-                val currentStatus by AudioStateRepo.currentStatus.collectAsState()
-                val lastFile by AudioStateRepo.lastSavedFile.collectAsState()
-                val isRunning by AudioStateRepo.isRunning.collectAsState()
-                val threshold by AudioStateRepo.currentThreshold.collectAsState()
+                if (currentScreen == "Main") {
+                    val currentDb by AudioStateRepo.currentDb.collectAsState()
+                    val currentStatus by AudioStateRepo.currentStatus.collectAsState()
+                    val lastFile by AudioStateRepo.lastSavedFile.collectAsState()
+                    val isRunning by AudioStateRepo.isRunning.collectAsState()
+                    val threshold by AudioStateRepo.currentThreshold.collectAsState()
 
-                MainUI(
-                    db = currentDb,
-                    threshold = threshold,
-                    statusText = currentStatus,
-                    isRunning = isRunning,
-                    file = lastFile,
-                    saveDirectory = saveDirectory,
-                    cleanupDays = cleanupDays,
-                    isAccessibilityEnabled = isAccessibilityEnabled,
-                    onCleanupDaysChanged = { 
-                        cleanupDays = it
-                        prefs.saveCleanupDays(it)
-                    },
-                    start = { checkPermission() },
-                    stop = { stopDetect() },
-                    chooseDirectory = { folderPicker.launch(null) },
-                    openAccessibilitySettings = {
-                        startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    Scaffold(
+                        topBar = {
+                            CenterAlignedTopAppBar(
+                                title = { Text("voice黑匣子") },
+                                actions = {
+                                    TextButton(onClick = { currentScreen = "Settings" }) {
+                                        Text("⚙ 设置")
+                                    }
+                                }
+                            )
+                        }
+                    ) { innerPadding ->
+                        MainUI(
+                            modifier = Modifier.padding(innerPadding),
+                            db = currentDb,
+                            threshold = threshold,
+                            statusText = currentStatus,
+                            isRunning = isRunning,
+                            file = lastFile,
+                            start = { checkPermission() },
+                            stop = { stopDetect() },
+                            onViewLogs = { currentScreen = "Logs" }
+                        )
                     }
-                )
+                } else if (currentScreen == "Settings") {
+                    BackHandler { currentScreen = "Main" }
+                    SettingsScreen(
+                        prefs = prefs,
+                        onBack = { currentScreen = "Main" },
+                        onChooseDirectory = { folderPicker.launch(null) },
+                        saveDirectory = saveDirectory,
+                        isAccessibilityEnabled = isAccessibilityEnabled,
+                        onOpenAccessibility = {
+                            startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                        }
+                    )
+                } else if (currentScreen == "Logs") {
+                    BackHandler { currentScreen = "Main" }
+                    LogScreen(onBack = { currentScreen = "Main" })
+                }
             }
         }
     }
@@ -143,8 +162,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkPermission() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        val permissionsToRequest = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val allGranted = permissionsToRequest.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+
+        if (!allGranted) {
+            permissionLauncher.launch(permissionsToRequest.toTypedArray())
         } else {
             startDetect()
         }
@@ -161,136 +190,103 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainUI(
+    modifier: Modifier = Modifier,
     db: Int,
     threshold: Int,
     statusText: String,
     isRunning: Boolean,
     file: String,
-    saveDirectory: String,
-    cleanupDays: Int,
-    isAccessibilityEnabled: Boolean,
-    onCleanupDaysChanged: (Int) -> Unit,
     start: () -> Unit,
     stop: () -> Unit,
-    chooseDirectory: () -> Unit,
-    openAccessibilitySettings: () -> Unit
+    onViewLogs: () -> Unit
 ) {
-    Scaffold(
-        modifier = Modifier.fillMaxSize()
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(24.dp)
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Button(
+            onClick = onViewLogs,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer, contentColor = MaterialTheme.colorScheme.onSecondaryContainer)
         ) {
-            Text(
-                text = "智能音频管家",
-                style = MaterialTheme.typography.headlineLarge,
-                color = MaterialTheme.colorScheme.primary
-            )
-            
-            Spacer(modifier = Modifier.height(32.dp))
+            Text("📜 查看系统运行日志")
+        }
 
-            // 分贝仪表卡片
-            ElevatedCard(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = if (isRunning) "● 录音中" else "○ 待命",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (isRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
-                    )
-                    Text(
-                        text = "$db dB",
-                        style = MaterialTheme.typography.displayLarge
-                    )
-                    Text(
-                        text = "触发阈值：$threshold dB",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+        Spacer(modifier = Modifier.height(16.dp))
 
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // 状态卡片
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(text = "系统状态", style = MaterialTheme.typography.titleMedium)
-                    Text(text = statusText, style = MaterialTheme.typography.bodyLarge)
-                    if (file.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(text = "已保存: $file", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // 设置区域
+        // 分贝仪表卡片
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = "⚙ 配置选项", style = MaterialTheme.typography.titleMedium)
-                }
-
-                Button(onClick = chooseDirectory, modifier = Modifier.fillMaxWidth()) {
-                    Text("选择录音存放文件夹")
-                }
                 Text(
-                    text = "当前目录: $saveDirectory",
-                    style = MaterialTheme.typography.bodySmall,
+                    text = if (isRunning) "● 正在监听" else "○ 待命",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (isRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                )
+                Text(
+                    text = "$db dB",
+                    style = MaterialTheme.typography.displayLarge
+                )
+                Text(
+                    text = "触发阈值：$threshold dB",
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-
-                Button(
-                    onClick = openAccessibilitySettings,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(if (isAccessibilityEnabled) "保活服务：正常" else "保活服务：点击开启")
-                }
-
-                Button(
-                    onClick = { onCleanupDaysChanged(if (cleanupDays == 0) 30 else 0) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(if (cleanupDays == 0) "自动清理：已关闭" else "自动清理：30天以前")
-                }
             }
+        }
 
-            Spacer(modifier = Modifier.height(40.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
-            if (!isRunning) {
-                Button(
-                    onClick = start,
-                    modifier = Modifier.fillMaxWidth().height(56.dp)
-                ) {
-                    Text("开启监听", style = MaterialTheme.typography.titleMedium)
-                }
-            } else {
-                Button(
-                    onClick = stop,
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                        contentColor = MaterialTheme.colorScheme.error
-                    )
-                ) {
-                    Text("停止监听", style = MaterialTheme.typography.titleMedium)
+        // 状态卡片
+        Card(
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(text = "系统状态", style = MaterialTheme.typography.titleMedium)
+                Text(text = statusText, style = MaterialTheme.typography.bodyLarge)
+                if (file.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(text = "最后录音: $file", style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
+
+        Spacer(modifier = Modifier.height(40.dp))
+
+        if (!isRunning) {
+            Button(
+                onClick = start,
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) {
+                Text("开启全天候监听", style = MaterialTheme.typography.titleMedium)
+            }
+        } else {
+            Button(
+                onClick = stop,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.error
+                )
+            ) {
+                Text("停止监听", style = MaterialTheme.typography.titleMedium)
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "App 将在后台持续运行并根据声音自动录制",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }

@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">7*24监听</string>
+    <string name="app_name">voice黑匣子</string>
     <string name="accessibility_description">开启此服务可帮助录音程序在后台更稳定运行，防止被系统清理。</string>
 </resources>

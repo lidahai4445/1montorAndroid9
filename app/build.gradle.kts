@@ -5,14 +5,12 @@ plugins {
 
 android {
     namespace = "com.example.testbutton"
-    compileSdk {
-        version = release(37)
-    }
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.testbutton"
         minSdk = 28
-        targetSdk = 37
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
@@ -21,15 +19,16 @@ android {
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            // 修正：移除了错误的 optimization 语法，替换为标准的 Android 混淆开关
+            isMinifyEnabled = false
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
     buildFeatures {
         compose = true
     }
